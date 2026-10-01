@@ -5,8 +5,6 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.github.lisama569.edgetelemetrygatewayjava.telemetry.model.TelemetryPoint;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.stereotype.Component;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -30,11 +28,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * - 未确认数据保留在文件中，重启后自动恢复续传（at-least-once）。
  * - 每次变更先写临时文件再原子替换，避免半写状态。
  */
-@Component
 public class FileTelemetryBuffer implements TelemetryBuffer {
 
     private static final Logger log = LoggerFactory.getLogger(FileTelemetryBuffer.class);
-    private static final String FILE_NAME = "buffer.jsonl";
+    private static final String DEFAULT_FILE_NAME = "buffer.jsonl";
 
     private final Path file;
     private final int capacity;
@@ -42,16 +39,30 @@ public class FileTelemetryBuffer implements TelemetryBuffer {
     private final AtomicLong dropped = new AtomicLong();
     private final ObjectMapper mapper = new ObjectMapper().registerModule(new JavaTimeModule());
 
-    public FileTelemetryBuffer(
-            @Value("${telemetry.buffer.dir:./data/buffer}") Path dir,
-            @Value("${telemetry.buffer.capacity:10000}") int capacity) {
-        this.file = dir.resolve(FILE_NAME);
+    /** 指定目录与容量，使用默认文件名 buffer.jsonl（兼容原单出口测试与行为）。 */
+    public FileTelemetryBuffer(Path dir, int capacity) {
+        this(dir.resolve(DEFAULT_FILE_NAME), capacity, Marker.FILE);
+    }
+
+    /** 指定完整文件路径，多个下游可各自使用独立文件与独立进度。 */
+    public static FileTelemetryBuffer at(Path file, int capacity) {
+        return new FileTelemetryBuffer(file, capacity, Marker.FILE);
+    }
+
+    /** 仅用于与公共 (Path,int) 目录构造器做签名消歧的私有标记。 */
+    private enum Marker { FILE }
+
+    private FileTelemetryBuffer(Path file, int capacity, Marker marker) {
+        this.file = file;
         this.capacity = capacity;
         try {
-            Files.createDirectories(dir);
+            Path parent = file.toAbsolutePath().getParent();
+            if (parent != null) {
+                Files.createDirectories(parent);
+            }
             load();
         } catch (IOException e) {
-            throw new UncheckedIOException("failed to init buffer at " + dir, e);
+            throw new UncheckedIOException("failed to init buffer at " + file, e);
         }
         log.info("buffer initialized: file={} capacity={} recovered={}", file, capacity, queue.size());
     }
@@ -116,7 +127,7 @@ public class FileTelemetryBuffer implements TelemetryBuffer {
 
     private void persist() {
         try {
-            Path tmp = file.resolveSibling(FILE_NAME + ".tmp");
+            Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
             List<String> lines = new ArrayList<>(queue.size());
             for (TelemetryPoint p : queue) {
                 lines.add(mapper.writeValueAsString(p));
