@@ -3,20 +3,22 @@ package com.github.lisama569.edgetelemetrygatewayjava.telemetry.forward;
 import com.github.lisama569.edgetelemetrygatewayjava.telemetry.model.TelemetryPoint;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.stereotype.Component;
 
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * 本地模拟云端通道：
+ * 本地模拟云端通道（传统单出口，非幂等）：
  * - 可通过 bringUp()/bringDown() 模拟通道抖动与恢复；
  * - 通道 down 时 send 返回 false，调用方不得 ack；
  * - 成功接收的批次记录在 received 中，供测试与本地验证核对；
  * - 可配置模拟时延，用于背压场景。
+ *
+ * <p>注：Spring 运行期已切换为
+ * {@link com.github.lisama569.edgetelemetrygatewayjava.telemetry.fanout.IdempotentSimulatedChannel}
+ * （按身份幂等、台账持久化）。本类保留供原有单出口单测直接构造使用。</p>
  */
-@Component
 public class SimulatedCloudChannel implements CloudChannel {
 
     private static final Logger log = LoggerFactory.getLogger(SimulatedCloudChannel.class);

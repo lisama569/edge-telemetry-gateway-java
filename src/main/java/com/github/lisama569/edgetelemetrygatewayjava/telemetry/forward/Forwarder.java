@@ -5,7 +5,6 @@ import com.github.lisama569.edgetelemetrygatewayjava.telemetry.model.TelemetryPo
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.stereotype.Component;
 
 import java.util.List;
 import java.util.concurrent.Executors;
@@ -20,8 +19,11 @@ import java.util.concurrent.atomic.AtomicLong;
  * - 采集侧写入只受缓存容量约束；容量满时由缓存确定性地淘汰最旧并计数，绝不静默丢弃。
  * - 单消费循环 + 队首 ack 保证转发顺序与缓存顺序一致，多轮重试/重启后结论可复现。
  * - 通道 down 或发送失败时不 ack，数据保留；状态通过计数器与日志可观测。
+ *
+ * <p>注：Spring 运行期已切换为
+ * {@link com.github.lisama569.edgetelemetrygatewayjava.telemetry.fanout.FanOutForwarder}
+ * （多下游 + 幂等）。本类保留为传统单出口语义的可独立构造工具，供原有单测直接使用。</p>
  */
-@Component
 public class Forwarder {
 
     private static final Logger log = LoggerFactory.getLogger(Forwarder.class);
