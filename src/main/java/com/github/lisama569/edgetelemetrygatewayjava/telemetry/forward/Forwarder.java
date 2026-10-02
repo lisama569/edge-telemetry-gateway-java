@@ -1,6 +1,7 @@
 package com.github.lisama569.edgetelemetrygatewayjava.telemetry.forward;
 
 import com.github.lisama569.edgetelemetrygatewayjava.telemetry.buffer.TelemetryBuffer;
+import com.github.lisama569.edgetelemetrygatewayjava.telemetry.buffer.fanout.BufferEndpoint;
 import com.github.lisama569.edgetelemetrygatewayjava.telemetry.downstream.DownstreamChannel;
 import com.github.lisama569.edgetelemetrygatewayjava.telemetry.model.TelemetryPoint;
 import org.slf4j.Logger;
@@ -30,11 +31,20 @@ public class Forwarder {
     private static final Logger log = LoggerFactory.getLogger(Forwarder.class);
 
     private final String name;
-    private final TelemetryBuffer buffer;
+    private final Source source;
     private final Predicate<List<TelemetryPoint>> send;
     private final java.util.function.BooleanSupplier up;
     private final int batchSize;
     private final long intervalMillis;
+
+    /** 转发循环读取/确认的数据来源：屏蔽单出口缓存与共享扇出消费者视图的差异。 */
+    private interface Source {
+        List<TelemetryPoint> peekBatch(int max);
+
+        void ack(int count);
+
+        long size();
+    }
 
     private final AtomicLong flushRounds = new AtomicLong();
     private final AtomicLong flushedTotal = new AtomicLong();
@@ -43,18 +53,62 @@ public class Forwarder {
 
     private ScheduledExecutorService executor;
 
-    /** 新双下游路径：绑定一个具名下游通道。 */
+    /** 新双下游路径：绑定共享扇出缓存上的某个下游消费者视图。 */
+    public Forwarder(String name,
+                     BufferEndpoint endpoint,
+                     DownstreamChannel channel,
+                     int batchSize,
+                     long intervalMillis) {
+        this(name,
+                new Source() {
+                    @Override
+                    public List<TelemetryPoint> peekBatch(int max) {
+                        return endpoint.peekBatch(max);
+                    }
+
+                    @Override
+                    public void ack(int count) {
+                        endpoint.ack(count);
+                    }
+
+                    @Override
+                    public long size() {
+                        return endpoint.pending();
+                    }
+                },
+                batch -> channel.deliver(batch) != null,
+                channel::isUp,
+                batchSize,
+                intervalMillis);
+    }
+
+    /** 新双下游路径：绑定一个具名下游通道与独立缓存。 */
     public Forwarder(String name,
                      TelemetryBuffer buffer,
                      DownstreamChannel channel,
                      int batchSize,
                      long intervalMillis) {
-        this.name = name;
-        this.buffer = buffer;
-        this.send = batch -> channel.deliver(batch) != null;
-        this.up = channel::isUp;
-        this.batchSize = batchSize;
-        this.intervalMillis = intervalMillis;
+        this(name,
+                new Source() {
+                    @Override
+                    public List<TelemetryPoint> peekBatch(int max) {
+                        return buffer.peekBatch(max);
+                    }
+
+                    @Override
+                    public void ack(int count) {
+                        buffer.ack(count);
+                    }
+
+                    @Override
+                    public long size() {
+                        return buffer.size();
+                    }
+                },
+                batch -> channel.deliver(batch) != null,
+                channel::isUp,
+                batchSize,
+                intervalMillis);
     }
 
     /** 兼容原单出口路径：基于 {@link CloudChannel}，名称固定为 cloud。 */
@@ -62,17 +116,37 @@ public class Forwarder {
                      CloudChannel channel,
                      int batchSize,
                      long intervalMillis) {
-        this("cloud", buffer, batchSize, intervalMillis, channel::send, channel::isUp);
+        this("cloud",
+                new Source() {
+                    @Override
+                    public List<TelemetryPoint> peekBatch(int max) {
+                        return buffer.peekBatch(max);
+                    }
+
+                    @Override
+                    public void ack(int count) {
+                        buffer.ack(count);
+                    }
+
+                    @Override
+                    public long size() {
+                        return buffer.size();
+                    }
+                },
+                channel::send,
+                channel::isUp,
+                batchSize,
+                intervalMillis);
     }
 
     private Forwarder(String name,
-                      TelemetryBuffer buffer,
-                      int batchSize,
-                      long intervalMillis,
+                      Source source,
                       Predicate<List<TelemetryPoint>> send,
-                      java.util.function.BooleanSupplier up) {
+                      java.util.function.BooleanSupplier up,
+                      int batchSize,
+                      long intervalMillis) {
         this.name = name;
-        this.buffer = buffer;
+        this.source = source;
         this.send = send;
         this.up = up;
         this.batchSize = batchSize;
@@ -126,10 +200,10 @@ public class Forwarder {
         flushRounds.incrementAndGet();
         if (!up.getAsBoolean()) {
             skippedChannelDown.incrementAndGet();
-            log.debug("forwarder[{}] channel down, skip flush (buffered={})", name, buffer.size());
+            log.debug("forwarder[{}] channel down, skip flush (buffered={})", name, source.size());
             return 0;
         }
-        List<TelemetryPoint> batch = buffer.peekBatch(batchSize);
+        List<TelemetryPoint> batch = source.peekBatch(batchSize);
         if (batch.isEmpty()) {
             return 0;
         }
@@ -149,12 +223,12 @@ public class Forwarder {
         if (!ok) {
             failedRounds.incrementAndGet();
             log.warn("forwarder[{}] channel rejected batch of {}, kept for retry (buffered={})",
-                    name, batch.size(), buffer.size());
+                    name, batch.size(), source.size());
             return 0;
         }
-        buffer.ack(batch.size());
+        source.ack(batch.size());
         flushedTotal.addAndGet(batch.size());
-        log.debug("forwarder[{}] flushed {} entries, remaining={}", name, batch.size(), buffer.size());
+        log.debug("forwarder[{}] flushed {} entries, remaining={}", name, batch.size(), source.size());
         return batch.size();
     }
 

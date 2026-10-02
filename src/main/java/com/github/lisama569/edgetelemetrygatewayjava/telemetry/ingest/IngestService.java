@@ -3,6 +3,7 @@ package com.github.lisama569.edgetelemetrygatewayjava.telemetry.ingest;
 import com.github.lisama569.edgetelemetrygatewayjava.telemetry.buffer.TelemetryBuffer;
 import com.github.lisama569.edgetelemetrygatewayjava.telemetry.downstream.DownstreamFanOut;
 import com.github.lisama569.edgetelemetrygatewayjava.telemetry.model.RawFrame;
+import com.github.lisama569.edgetelemetrygatewayjava.telemetry.model.TelemetryPoint;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -58,15 +59,16 @@ public class IngestService {
         }
         final IngestResult checked;
         try {
-            checked = dedupGate.check(normalizer.normalize(frame));
+            TelemetryPoint normalized = normalizer.normalize(frame);
+            checked = dedupGate.checkAndEnqueue(normalized, point -> {
+                DownstreamFanOut.AppendOutcome outcome = fanOut.append(point);
+                return outcome == DownstreamFanOut.AppendOutcome.APPENDED;
+            });
         } catch (NormalizationException e) {
             return reject(e.reason(), e.getMessage());
         }
         switch (checked) {
-            case IngestResult.Accepted a -> {
-                accepted.incrementAndGet();
-                fanOut.append(a.point());
-            }
+            case IngestResult.Accepted a -> accepted.incrementAndGet();
             case IngestResult.Duplicate d -> {
                 duplicates.incrementAndGet();
                 log.info("ingest duplicate dropped: {} seq={}", d.point().key(), d.point().seq());
@@ -76,8 +78,9 @@ public class IngestService {
                 log.info("ingest late frame dropped: {} seq={} (lastSeq={})",
                         l.point().key(), l.point().seq(), l.lastSeenSeq());
             }
-            case IngestResult.Rejected ignored -> {
-                // 不可达：dedupGate 不会产生 Rejected
+            case IngestResult.Rejected r -> {
+                rejected.computeIfAbsent(r.reason(), reason -> new AtomicLong()).incrementAndGet();
+                log.info("ingest rejected: reason={} detail={}", r.reason(), r.detail());
             }
         }
         log.info("frame verdict: {}", verdictOf(checked));

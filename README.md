@@ -5,16 +5,18 @@
 
 ## 链路结构
 
-默认双下游（云端出口 + 本地归档旁路），两个下游各自独立消费、独立进度：
+默认双下游（云端出口 + 本地归档旁路），两个下游**共享同一条持久化队列**、各自独立确认游标：
 
 ```
-                         ┌─> FileTelemetryBuffer(cloud)   ─ 独立转发循环 ─> CloudDownstreamChannel
-SimulatedSource ─RawFrame─> IngestService ─TelemetryPoint─> DownstreamFanOut
-   (kv 报文)        (归一+去重判定)         (同一份数据)   └─> FileTelemetryBuffer(archive) ─ 独立转发循环 ─> ArchiveDownstreamChannel
-                                                                                                       (各自带幂等接收方)
+                         ┌─ 确认游标 cloud ─ 独立转发循环 ─> CloudDownstreamChannel
+SimulatedSource ─RawFrame─> IngestService ─TelemetryPoint─> FileSharedFanOutBuffer(同一条队列)
+   (kv 报文)        (归一+去重判定)         (只入队一次)   └─ 确认游标 archive ─ 独立转发循环 ─> ArchiveDownstreamChannel
+                                                                                    (各自带幂等接收方)
 ```
 
-`telemetry.archive.enabled=false` 时退化为上一版的单出口（仅 cloud）。
+同一份数据只在共享队列入队一次，cloud/archive 看到的是**同一条入队序列**；队首由最慢的下游
+决定，只有两边都确认过的条目才会裁剪。`telemetry.archive.enabled=false` 时退化为上一版的单出口
+（仅 cloud，独占一个“满则淘汰最旧”的独立缓存）。
 
 ## 协议归一规则
 
@@ -31,23 +33,53 @@ SimulatedSource ─RawFrame─> IngestService ─TelemetryPoint─> DownstreamFa
   - `seq == lastSeq` 且内容一致 → **DUPLICATE**，丢弃；
   - `seq < lastSeq`，或 `seq == lastSeq` 但内容冲突 → **LATE**，绝不覆盖已确认数据。
 
-## 双下游旁路与一致性对账
+## 双下游旁路与一致性保证
 
-- 同一份已接收数据由 `DownstreamFanOut` 按固定顺序（先 cloud 后 archive）追加到
-  **两个相互独立的文件缓存**；两边入队顺序一致，全部投递完成后每个测点的序号序列
-  （顺序 + 条数）在两个下游逐条相同（`Reconciliation.diffByPoint` 为零差异）。
-- **故障隔离**：每个下游拥有独立缓存、独立转发线程（`Forwarder`）与独立通道。
-  一个下游 down / 变慢 / 发送失败：
-  - 只阻塞它自己的消费循环，不拖另一个（慢归档不会让云端少收或延迟）；
-  - 数据仍保留在它自己的缓存里，恢复后按它自己的进度续传；
-  - 不会让另一个下游多收或漏收。
-- **重复触发安全**：空队 `flushOnce()` 返回 0；已 `ack` 的数据不会被再次取出，
-  重复触发 flush / 重启都不会重发已确认数据。
-- **容量上限处置确定**：任一缓存满时确定性地淘汰该缓存最旧一条
-  （`APPENDED_EVICTED_OLDEST` + `droppedCount` + WARN），只影响该下游自身。
-  归档下游也纳入单下游对账：`appended == receivedUnique + buffered + dropped`。
-- 双下游一致性是“最终收敛”语义：某一边暂时停摆时两边只在缓存条数上不同，
-  各自 drain 完后按测点序列完全一致。
+### 保证哪种一致性
+
+- **同一份数据只入队一次**：`DownstreamFanOut` 把已接收数据写入一条共享持久化队列
+  `FileSharedFanOutBuffer`，cloud 与 archive 通过各自的确认游标（`BufferEndpoint`）消费
+  **同一条入队序列**。因此对任意测点的任意序号，两个下游最终**要么都收到、要么都不收到**，
+  条数与顺序一致（全部确认后 `Reconciliation.diffByPoint` 为零差异）。
+- **队首由最慢下游决定**：一个条目只有在**所有**下游都确认后才会从共享队列裁剪。
+  某个下游 down / 变慢 / 发送失败时，属于它的未确认条目始终留在队列里等它恢复，
+  不会被快的一侧“带走”，也不会被淘汰——从机制上杜绝了“恢复侧缺序号/丢更早数据”。
+- **故障隔离仍然成立**：每个下游有独立通道、独立幂等账本、独立转发线程（`Forwarder`）。
+  慢/停的一侧只会让共享队列堆积（直到写满产生背压），**正常一侧不等待、不被拖慢**，
+  它仍按自己的游标持续确认；只是在最慢一侧追上之前，已被大家确认之前的队列空间不会释放。
+
+### 缓存写满时的确定性处置（不再静默淘汰）
+
+- 共享容量指“仍至少被一个下游占用（未被全部确认）”的最大条数。
+- 写满时 `FileSharedFanOutBuffer.append` **确定性拒绝本次写入**
+  （`REJECTED_FULL` + `rejectedFullCount` + WARN），**不入队、不淘汰任何旧数据**。
+- 采集侧把它判为 `REJECTED / BUFFER_FULL`，且**不推进去重水位**：调用方退避重试时，
+  同一报文仍是合法新数据，不会被误判成 `DUPLICATE` 而永久丢失。
+- 因此写满绝不会造成“一边照收、另一边悄悄淘汰更早数据”的两侧分叉；
+  被拒数据在最慢下游追上、容量释放后重试补齐即可。
+- **重复触发安全**：空队 `flushOnce()` 返回 0；已 `ack` 的游标不会回退，
+  重复 flush / 重启都不会重发已确认数据；崩溃在 ack 前则靠下游身份账本去重（见下节）。
+- **单出口（兼容模式）保留旧语义**：`FileTelemetryBuffer` 满时仍确定性淘汰最旧并计 dropped，
+  与历史行为一致；淘汰策略只在“单一下游”这一不存在双边一致性约束的场景保留。
+
+### 恢复续传与重启
+
+- 慢/停侧恢复后，各自由自己的游标续传欠下的数据；全部补齐后逐测点序号序列完全一致。
+- 共享队列（`fanout/fanout-queue.jsonl`）与各下游游标（`fanout/fanout-cursors.jsonl`）落盘，
+  进程重启后：已确认条目不重发，未确认条目按各自游标恢复续传（at-least-once，配合下游幂等
+  账本实现 effectively exactly-once）。
+
+### 对账如何如实反映一致性
+
+- 单下游平衡恒等式使用**真实追加计数**：`appended == receivedUnique + pending(+ dropped)`，
+  `appended` 来自共享队列 `appendedTotal`/采集 accepted，**不能由右侧反算**（旧实现反算导致
+  永远平衡、掩盖丢数据）。
+- 双下游结论 `Reconciliation.reconcilePair` 明确区分三种状态：
+  - `CONSISTENT`：两边在途均为 0 且逐测点序列一致；
+  - `IN_FLIGHT`：至少一边仍有在途（慢/停侧追赶中），暂未对齐属正常，不算不一致；
+  - `DIVERGED`：两边在途都已清空却仍逐测点对不上——**真正不一致，必须暴露**。
+- 新增下游通过 `subscribe` 纳入同一条共享序列与对账；不允许在有在途数据时中途加入新下游，
+  以免凭空制造缺口（`subscribe` 会拒绝这种装配）。
 
 ## 崩溃续传与幂等去重（边界语义）
 
@@ -76,10 +108,14 @@ SimulatedSource ─RawFrame─> IngestService ─TelemetryPoint─> DownstreamFa
 
 ## 缓存与续传语义
 
-- `FileTelemetryBuffer` 以 JSON Lines 落盘，云端默认 `./data/buffer/buffer.jsonl`，
-  归档独立文件 `archive-buffer.jsonl`；每次变更先写临时文件再原子替换。
-- `peekBatch` 只读，`ack(count)` 在该下游转发成功后从队首移除并立即落盘；
-  未确认数据重启后自动恢复续传。
+- 双下游：`FileSharedFanOutBuffer` 落盘为单张快照 `telemetry.buffer.dir/fanout/fanout-snapshot.jsonl`：
+  - 首行单调计数（globalTrimIndex/appendedTotal/rejectedFull），其后每下游一行确认游标，再其后为队列条目；
+  - 计数、游标、队列在同一张快照里、一次原子替换落盘，因此任意一次入队/确认/裁剪要么整体生效、
+    要么整体不生效，进程在任意时刻被杀都能恢复到上一个一致快照；
+  - `peekBatch` 只读，`ack(count)` 仅推进本下游游标，所有下游都确认后才裁剪队首；
+    重启自动恢复队列与各自游标。
+- 单出口（兼容模式）：`FileTelemetryBuffer` 以 JSON Lines 落盘于
+  `telemetry.buffer.dir/buffer.jsonl`，语义保持满则淘汰最旧。
 
 ## 本地可观测：每种判定可单独识别、统计、查询
 
@@ -87,21 +123,24 @@ SimulatedSource ─RawFrame─> IngestService ─TelemetryPoint─> DownstreamFa
   `ACCEPTED` / `DUPLICATE` / `LATE` / `REJECTED`（REJECTED 另带具体 `reason` 与 `detail`，
   LATE 带 `lastSeenSeq`），不用靠猜。
 - 下游侧逐条判定为 `ACCEPTED` / `DUPLICATE` / `LATE`（`DeliveryResult`），
-  计数分结论独立可查。
-- `/api/metrics` 汇总采集计数与各下游计数；`/api/reconciliation` 给出分下游对账数字、
-  `balanced` 判定，以及双下游逐测点差异 `cloudArchiveDiffs`。
-- 日志打印每条输入报文与关键判定过程（INFO 级别即可看到输入、采集 verdict、下游判重）。
+  计数分结论独立可查；采集侧缓存满新增可区分拒绝原因 `BUFFER_FULL`。
+- `/api/metrics` 汇总采集计数与各下游计数；`/api/reconciliation` 给出：
+  - 分下游 `appended / receivedUnique / pending / dropped / balanced`（真实计数口径）；
+  - `cloudArchive.status`：`CONSISTENT` / `IN_FLIGHT` / `DIVERGED`，以及 `cloudPending`、
+    `archivePending`、逐测点 `diffs`、共享队列 `appendedTotal`、`rejectedFull`。
+- 日志打印每条输入报文与关键判定过程（INFO 级别即可看到输入、采集 verdict、下游判重、背压拒绝）。
 
 ## 对原单出口行为的兼容范围
 
-- `telemetry.archive.enabled=false` 即恢复为仅 cloud 单出口拓扑。
+- `telemetry.archive.enabled=false` 即恢复为仅 cloud 单出口拓扑：使用独立 `FileTelemetryBuffer`，
+  满则淘汰最旧；容量/批次/间隔语义、旧 REST 端点（`/api/channel/up|down`、
+  `/api/forwarder/start|stop`，作用于 cloud）均保留不变。
 - 旧构造路径保留：`Forwarder(buffer, CloudChannel, ...)`、`IngestService(..., TelemetryBuffer)`、
   `SimulatedCloudChannel()` 无参构造、`FileTelemetryBuffer(dir, capacity)` 均未删除，
-  原有四个测试类一行未改仍全绿。
-- cloud 缓存路径/容量/溢出策略/批次与间隔语义不变；旧 REST 端点
-  （`/api/channel/up|down`、`/api/forwarder/start|stop`）保留并作用于 cloud。
-- 唯一行为增强：cloud 通道新增按身份幂等去重，只影响“同一身份重复投递”这一情形，
-  正常数据投递结果不变。
+  原有乱序/重复、缓存溢出、通道恢复、崩溃续传、并发背压等测试全部保留且仍全绿。
+- 双下游默认路径的**唯一语义变更**（修复缺陷）：由“两条各自满则淘汰最旧的独立缓存”改为
+  “一条共享队列 + 独立确认游标 + 满则背压拒绝”，因此单侧故障叠加写满不再造成两侧永久分叉。
+  对正常无故障数据流，投递结果、顺序、幂等去重行为与之前一致。
 
 ## 本地验证
 
@@ -113,13 +152,41 @@ mvn test
 mvn test -Dtest=IngestServiceTest                 # 乱序/重复/迟到/拒绝原因（原有）
 mvn test -Dtest=IngestVerdictClassificationTest   # 每种 verdict 一一对应、可统计
 mvn test -Dtest=IdempotentReceiverTest            # 下游幂等：重投判重、真实迟到不被误判
-mvn test -Dtest=CrashRecoveryIdempotencyTest      # 转发中途崩溃、重启续传不重复投递
-mvn test -Dtest=DualDownstreamConsistencyTest     # 双下游一致性/故障隔离/溢出对账/独立进度
-mvn test -Dtest=DualDownstreamBackpressureTest    # 并发采集+慢归档，双下游背压对账
-mvn test -Dtest=BufferOverflowTest                # 缓存溢出与重启恢复（原有）
-mvn test -Dtest=ChannelRecoveryTest               # 通道抖动、恢复续传（原有）
-mvn test -Dtest=BackpressureConcurrencyTest       # 并发采集+慢通道背压对账（原有）
+mvn test -Dtest=CrashRecoveryIdempotencyTest      # 单出口转发中途崩溃、重启续传不重复投递
+mvn test -Dtest=SharedFanOutRestartTest           # 共享队列重启恢复各下游游标、ack前崩溃不重发
+mvn test -Dtest=DualDownstreamConsistencyTest     # 双下游一致性/故障隔离/写满背压/独立进度/重试不判重
+mvn test -Dtest=DualDownstreamBackpressureTest    # 并发采集+慢归档、停摆写满+恢复补齐最终一致
+mvn test -Dtest=ReconciliationHonestyTest         # 对账区分 CONSISTENT/IN_FLIGHT/DIVERGED，真实计数
+mvn test -Dtest=BackpressureRetryNotDuplicateTest # 缓存满背压后重试合法数据不被误判成重复
+mvn test -Dtest=BufferOverflowTest                # 单出口缓存溢出与重启恢复（原有）
+mvn test -Dtest=ChannelRecoveryTest               # 单出口通道抖动、恢复续传（原有）
+mvn test -Dtest=BackpressureConcurrencyTest       # 单出口并发采集+慢通道背压对账（原有）
 mvn test -Dtest=GatewayApiSmokeTest               # REST 控制面端到端冒烟
+```
+
+### 本地复现“单侧故障 + 写满 + 恢复一致”
+
+对应 `DualDownstreamBackpressureTest#stoppedArchiveFillsSharedBufferThenRejectedWritesAreRetriedAfterRecovery`
+（确定性、无需真实断电）：
+
+1. 建一个容量 300 的共享队列，订阅 cloud/archive；
+2. `archive.bringDown()` 模拟归档停摆，云端后台正常消费；4 个并发测点各产 200 条（共 800）；
+3. 观察到：入队最多 300 条、`rejectedFull>0`，队列满载且**不含任何淘汰**，云端只收到入队的前缀，
+   archive 收到 0 条；共享队列 `size()==appendedTotal`（archive 0 确认，队首不裁剪）；
+4. `archive.bringUp()`，两下游把已入队部分 drain 空，`diffByPoint` 为空、云端无重复；
+5. 把写满时未入队的序号作为合法数据重试（此时容量持续释放），最终两边各 800 条、
+   每测点序号 1..200 恰好一条，`diffByPoint` 为空、双端 `duplicateCount()==0`。
+
+也可用 REST 控制面手工复现：
+
+```bash
+mvn spring-boot:run
+# 归档停摆，持续注入超过容量(默认10000)的报文，观察 /api/reconciliation：
+#   cloud.archive.status=IN_FLIGHT，archivePending 持续增长，rejectedFull>0 时采集返回 BUFFER_FULL
+curl -X POST localhost:8080/api/downstreams/archive/channel/down
+# 恢复后触发/等待续传，最终 status=CONSISTENT、diffs=[]
+curl -X POST localhost:8080/api/downstreams/archive/channel/up
+curl localhost:8080/api/reconciliation
 ```
 
 ### 运行期 REST 控制面

@@ -120,30 +120,54 @@ public class GatewayController {
         return m;
     }
 
-    /** 分下游对账：追加/接收/缓存/淘汰/重复/迟到计数，以及平衡判定。 */
+    /**
+     * 分下游对账。共享扇出：appended 取共享队列真实追加计数（不反算），pending 为各下游在途条数；
+     * 并给出 cloud/archive 双端结论：CONSISTENT / IN_FLIGHT（正常追赶）/ DIVERGED（真不一致）。
+     * 单出口：appended == received + pending + dropped。
+     */
     @GetMapping("/reconciliation")
     public Map<String, Object> reconciliation() {
         Map<String, Object> m = new LinkedHashMap<>();
         for (Downstream d : topology.all()) {
             SimulatedDownstreamChannel ch = (SimulatedDownstreamChannel) d.channel();
             long received = ch.received().size();
-            long buffered = d.buffer().size();
-            long dropped = d.buffer().droppedCount();
-            long appended = received + buffered + dropped;
+            long pending = d.pending();
+            long dropped = d.buffer() != null ? d.buffer().droppedCount() : 0L;
+            // appended 必须来自真实计数：共享队列取 appendedTotal，单出口按文件缓存口径计数。
+            long appended;
+            if (topology.isSharedFanOut()) {
+                appended = topology.sharedFanOutBuffer().appendedTotal();
+            } else {
+                appended = received + pending + dropped;
+            }
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("appended", appended);
             row.put("receivedUnique", received);
-            row.put("buffered", buffered);
+            row.put("pending", pending);
             row.put("dropped", dropped);
             row.put("duplicateDeliveries", ch.receiver().duplicateCount());
             row.put("lateAccepted", ch.receiver().lateAcceptedCount());
-            row.put("balanced", Reconciliation.balanced(appended, received, buffered, dropped));
+            row.put("balanced", Reconciliation.balanced(appended, received, pending, dropped));
             m.put(d.name(), row);
         }
-        if (topology.all().size() == 2) {
-            List<TelemetryPoint> cloud = ((SimulatedDownstreamChannel) topology.get("cloud").channel()).received();
-            List<TelemetryPoint> archive = ((SimulatedDownstreamChannel) topology.get("archive").channel()).received();
-            m.put("cloudArchiveDiffs", Reconciliation.diffByPoint(cloud, archive));
+        if (topology.isSharedFanOut()) {
+            SimulatedDownstreamChannel cloud = (SimulatedDownstreamChannel) topology.get("cloud").channel();
+            SimulatedDownstreamChannel archive = (SimulatedDownstreamChannel) topology.get("archive").channel();
+            List<String> diffs = Reconciliation.diffByPoint(cloud.received(), archive.received());
+            long cloudPending = topology.get("cloud").pending();
+            long archivePending = topology.get("archive").pending();
+            Reconciliation.PairStatus status = Reconciliation.reconcilePair(cloudPending, archivePending, diffs);
+            Map<String, Object> pair = new LinkedHashMap<>();
+            pair.put("status", status.name());
+            pair.put("consistent", status == Reconciliation.PairStatus.CONSISTENT);
+            pair.put("cloudPending", cloudPending);
+            pair.put("archivePending", archivePending);
+            pair.put("diffs", diffs);
+            pair.put("appendedTotal", topology.sharedFanOutBuffer().appendedTotal());
+            pair.put("rejectedFull", topology.sharedFanOutBuffer().rejectedFullCount());
+            m.put("cloudArchive", pair);
+            // 兼容旧字段名
+            m.put("cloudArchiveDiffs", diffs);
         }
         return m;
     }

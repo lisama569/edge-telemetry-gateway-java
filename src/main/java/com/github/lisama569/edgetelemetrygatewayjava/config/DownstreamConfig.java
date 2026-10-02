@@ -2,6 +2,8 @@ package com.github.lisama569.edgetelemetrygatewayjava.config;
 
 import com.github.lisama569.edgetelemetrygatewayjava.telemetry.buffer.FileTelemetryBuffer;
 import com.github.lisama569.edgetelemetrygatewayjava.telemetry.buffer.TelemetryBuffer;
+import com.github.lisama569.edgetelemetrygatewayjava.telemetry.buffer.fanout.BufferEndpoint;
+import com.github.lisama569.edgetelemetrygatewayjava.telemetry.buffer.fanout.FileSharedFanOutBuffer;
 import com.github.lisama569.edgetelemetrygatewayjava.telemetry.downstream.ArchiveDownstreamChannel;
 import com.github.lisama569.edgetelemetrygatewayjava.telemetry.downstream.CloudDownstreamChannel;
 import com.github.lisama569.edgetelemetrygatewayjava.telemetry.downstream.Downstream;
@@ -21,9 +23,11 @@ import java.util.List;
 /**
  * 下游拓扑装配。
  *
- * - 默认启用归档旁路（telemetry.archive.enabled=true）：cloud + archive 两个独立下游，
- *   各自拥有独立文件缓存（独立进度）、独立幂等身份账本（文件，跨重启保留）、独立转发线程；
- * - 关闭时退化为原单出口（仅 cloud），行为与上一版本兼容。
+ * - 默认启用归档旁路（telemetry.archive.enabled=true）：cloud + archive 共享一条持久化队列
+ *   {@link FileSharedFanOutBuffer}，同一份数据只入队一次，两边以各自确认游标消费同一条序列，
+ *   因此单侧故障/变慢 + 写满都不会造成两侧分叉；各下游仍有独立通道、独立幂等账本、独立转发线程。
+ * - 关闭时退化为原单出口（仅 cloud），使用独立 {@link FileTelemetryBuffer}，满则淘汰最旧，
+ *   行为与原单出口版本兼容。
  */
 @Configuration
 public class DownstreamConfig {
@@ -46,39 +50,42 @@ public class DownstreamConfig {
     @Value("${telemetry.archive.enabled:true}")
     private boolean archiveEnabled;
 
-    @Value("${telemetry.archive.buffer.capacity:10000}")
-    private int archiveCapacity;
-
     @Bean
     public DownstreamTopology downstreamTopology() {
         List<Downstream> list = new ArrayList<>();
-        list.add(buildCloud());
         if (archiveEnabled) {
-            list.add(buildArchive());
+            FileSharedFanOutBuffer shared =
+                    new FileSharedFanOutBuffer(bufferDir.resolve("fanout"), capacity);
+            BufferEndpoint cloudEndpoint = shared.subscribe("cloud");
+            BufferEndpoint archiveEndpoint = shared.subscribe("archive");
+
+            CloudDownstreamChannel cloudChannel = new CloudDownstreamChannel("cloud",
+                    new IdempotentReceiver(new FileIdentityStore(identityDir.resolve("cloud-identities.jsonl"))));
+            ArchiveDownstreamChannel archiveChannel = new ArchiveDownstreamChannel("archive",
+                    new IdempotentReceiver(new FileIdentityStore(identityDir.resolve("archive-identities.jsonl"))));
+
+            Forwarder cloudForwarder = new Forwarder("cloud", cloudEndpoint, cloudChannel, batchSize, intervalMillis);
+            Forwarder archiveForwarder = new Forwarder("archive", archiveEndpoint, archiveChannel, batchSize, intervalMillis);
+
+            list.add(Downstream.shared("cloud", cloudChannel, cloudForwarder, cloudEndpoint));
+            list.add(Downstream.shared("archive", archiveChannel, archiveForwarder, archiveEndpoint));
+            return new DownstreamTopology(list, shared);
+        } else {
+            TelemetryBuffer buffer = new FileTelemetryBuffer(bufferDir, capacity);
+            CloudDownstreamChannel channel = new CloudDownstreamChannel("cloud",
+                    new IdempotentReceiver(new FileIdentityStore(identityDir.resolve("cloud-identities.jsonl"))));
+            Forwarder forwarder = new Forwarder("cloud", buffer, channel, batchSize, intervalMillis);
+            list.add(Downstream.standalone("cloud", channel, forwarder, buffer));
+            return new DownstreamTopology(list);
         }
-        return new DownstreamTopology(list);
-    }
-
-    private Downstream buildCloud() {
-        TelemetryBuffer buffer = new FileTelemetryBuffer(bufferDir, capacity);
-        IdempotentReceiver receiver = new IdempotentReceiver(
-                new FileIdentityStore(identityDir.resolve("cloud-identities.jsonl")));
-        CloudDownstreamChannel channel = new CloudDownstreamChannel("cloud", receiver);
-        Forwarder forwarder = new Forwarder("cloud", buffer, channel, batchSize, intervalMillis);
-        return new Downstream("cloud", buffer, channel, forwarder);
-    }
-
-    private Downstream buildArchive() {
-        TelemetryBuffer buffer = FileTelemetryBuffer.at(bufferDir.resolve("archive-buffer.jsonl"), archiveCapacity);
-        IdempotentReceiver receiver = new IdempotentReceiver(
-                new FileIdentityStore(identityDir.resolve("archive-identities.jsonl")));
-        ArchiveDownstreamChannel channel = new ArchiveDownstreamChannel("archive", receiver);
-        Forwarder forwarder = new Forwarder("archive", buffer, channel, batchSize, intervalMillis);
-        return new Downstream("archive", buffer, channel, forwarder);
     }
 
     @Bean
     public DownstreamFanOut downstreamFanOut(DownstreamTopology topology) {
-        return new DownstreamFanOut(topology);
+        // 双下游：全部下游共享同一队列；单出口：直接写 cloud 的独立缓存。
+        if (topology.isSharedFanOut()) {
+            return new DownstreamFanOut(topology.sharedFanOutBuffer());
+        }
+        return new DownstreamFanOut(topology.all().get(0).buffer());
     }
 }
