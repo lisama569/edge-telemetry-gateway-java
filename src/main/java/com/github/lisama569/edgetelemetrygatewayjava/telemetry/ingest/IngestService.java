@@ -31,6 +31,8 @@ public class IngestService {
     private final AtomicLong accepted = new AtomicLong();
     private final AtomicLong duplicates = new AtomicLong();
     private final AtomicLong late = new AtomicLong();
+    /** 采集侧接受、但双下游共享缓存满而被两侧一致整条拒绝的条数。 */
+    private final AtomicLong downstreamOverflowRejected = new AtomicLong();
     private final Map<RejectReason, AtomicLong> rejected = new ConcurrentHashMap<>();
 
     @Autowired
@@ -65,7 +67,10 @@ public class IngestService {
         switch (checked) {
             case IngestResult.Accepted a -> {
                 accepted.incrementAndGet();
-                fanOut.append(a.point());
+                TelemetryBuffer.AppendOutcome outcome = fanOut.append(a.point());
+                if (outcome.status() == TelemetryBuffer.AppendStatus.REJECTED_FULL) {
+                    downstreamOverflowRejected.incrementAndGet();
+                }
             }
             case IngestResult.Duplicate d -> {
                 duplicates.incrementAndGet();
@@ -103,6 +108,11 @@ public class IngestService {
 
     public long acceptedCount() {
         return accepted.get();
+    }
+
+    /** 采集侧接受、但下游共享缓存满而被整条拒绝（所有下游一致不收）的条数。 */
+    public long downstreamOverflowRejectedCount() {
+        return downstreamOverflowRejected.get();
     }
 
     public long duplicateCount() {

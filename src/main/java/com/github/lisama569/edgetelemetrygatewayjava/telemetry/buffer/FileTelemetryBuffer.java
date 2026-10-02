@@ -37,6 +37,8 @@ public class FileTelemetryBuffer implements TelemetryBuffer {
     private final int capacity;
     private final Deque<TelemetryPoint> queue = new ArrayDeque<>();
     private final AtomicLong dropped = new AtomicLong();
+    private final AtomicLong appended = new AtomicLong();
+    private final AtomicLong rejected = new AtomicLong();
     private final ObjectMapper mapper = new ObjectMapper().registerModule(new JavaTimeModule());
 
     /** 指定目录与容量，使用默认文件名 buffer.jsonl（兼容原单出口测试与行为）。 */
@@ -64,6 +66,7 @@ public class FileTelemetryBuffer implements TelemetryBuffer {
         } catch (IOException e) {
             throw new UncheckedIOException("failed to init buffer at " + file, e);
         }
+        appended.set(queue.size());
         log.info("buffer initialized: file={} capacity={} recovered={}", file, capacity, queue.size());
     }
 
@@ -90,6 +93,7 @@ public class FileTelemetryBuffer implements TelemetryBuffer {
                     capacity, evicted.seq(), evicted.key(), dropped.get());
         }
         queue.addLast(point);
+        appended.incrementAndGet();
         persist();
         return new AppendOutcome(status, evicted);
     }
@@ -123,6 +127,16 @@ public class FileTelemetryBuffer implements TelemetryBuffer {
     @Override
     public long droppedCount() {
         return dropped.get();
+    }
+
+    @Override
+    public long appendedCount() {
+        return appended.get();
+    }
+
+    @Override
+    public long rejectedCount() {
+        return rejected.get();
     }
 
     private void persist() {

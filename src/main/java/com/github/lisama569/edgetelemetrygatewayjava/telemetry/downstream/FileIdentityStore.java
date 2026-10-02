@@ -11,6 +11,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -73,6 +75,28 @@ public class FileIdentityStore implements IdentityStore {
     @Override
     public synchronized long watermark(String pointKey) {
         return watermarks.getOrDefault(pointKey, -1L);
+    }
+
+    @Override
+    public synchronized long size() {
+        return received.size();
+    }
+
+    @Override
+    public synchronized List<PointIdentity> identitiesForPoint(String pointKey) {
+        List<PointIdentity> ids = new ArrayList<>();
+        for (PointIdentity id : received) {
+            if (id.pointKey().equals(pointKey)) {
+                ids.add(id);
+            }
+        }
+        ids.sort(Comparator.comparingLong(PointIdentity::seq));
+        return ids;
+    }
+
+    @Override
+    public synchronized Set<String> pointKeys() {
+        return Set.copyOf(watermarks.keySet());
     }
 
     @Override

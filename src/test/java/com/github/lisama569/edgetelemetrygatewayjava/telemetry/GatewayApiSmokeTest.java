@@ -80,8 +80,13 @@ class GatewayApiSmokeTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.cloud.balanced").value(true))
                 .andExpect(jsonPath("$.archive.balanced").value(true))
+                .andExpect(jsonPath("$.cloud.admitted").value(1))
+                .andExpect(jsonPath("$.archive.admitted").value(1))
+                .andExpect(jsonPath("$.cloud.evicted").value(0))
+                .andExpect(jsonPath("$.cloud.rejectedFull").value(0))
                 .andExpect(jsonPath("$.cloud.receivedUnique").value(1))
                 .andExpect(jsonPath("$.archive.receivedUnique").value(1))
+                .andExpect(jsonPath("$.crossDownstreamConsistent").value(true))
                 .andExpect(jsonPath("$.cloudArchiveDiffs").isArray());
 
         mvc.perform(get("/api/metrics"))

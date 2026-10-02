@@ -2,6 +2,9 @@ package com.github.lisama569.edgetelemetrygatewayjava.telemetry.downstream;
 
 import com.github.lisama569.edgetelemetrygatewayjava.telemetry.model.PointIdentity;
 
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -28,5 +31,27 @@ public class InMemoryIdentityStore implements IdentityStore {
     public void accept(PointIdentity identity) {
         received.add(identity);
         watermarks.merge(identity.pointKey(), identity.seq(), Math::max);
+    }
+
+    @Override
+    public long size() {
+        return received.size();
+    }
+
+    @Override
+    public List<PointIdentity> identitiesForPoint(String pointKey) {
+        List<PointIdentity> ids = new ArrayList<>();
+        for (PointIdentity id : received) {
+            if (id.pointKey().equals(pointKey)) {
+                ids.add(id);
+            }
+        }
+        ids.sort(Comparator.comparingLong(PointIdentity::seq));
+        return ids;
+    }
+
+    @Override
+    public Set<String> pointKeys() {
+        return java.util.Set.copyOf(watermarks.keySet());
     }
 }

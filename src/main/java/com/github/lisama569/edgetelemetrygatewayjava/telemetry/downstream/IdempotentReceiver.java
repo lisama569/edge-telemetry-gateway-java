@@ -83,4 +83,9 @@ public class IdempotentReceiver {
     public boolean contains(TelemetryPoint point) {
         return store.contains(PointIdentity.of(point));
     }
+
+    /** 下游已接收身份账本（持久账本跨重启保留，用于对账）。 */
+    public IdentityStore store() {
+        return store;
+    }
 }

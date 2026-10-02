@@ -16,6 +16,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -106,6 +107,7 @@ public class GatewayController {
         m.put("ingest.accepted", ingestService.acceptedCount());
         m.put("ingest.duplicates", ingestService.duplicateCount());
         m.put("ingest.late", ingestService.lateCount());
+        m.put("downstream.overflowRejected", ingestService.downstreamOverflowRejectedCount());
         Map<String, Long> rejected = new LinkedHashMap<>();
         for (RejectReason reason : RejectReason.values()) {
             rejected.put(reason.name(), ingestService.rejectedCount(reason));
@@ -120,30 +122,43 @@ public class GatewayController {
         return m;
     }
 
-    /** 分下游对账：追加/接收/缓存/淘汰/重复/迟到计数，以及平衡判定。 */
+    /** 分下游对账：真实准入/接收/缓存/淘汰/整条拒绝计数、平衡判定，以及跨下游序列一致性。 */
     @GetMapping("/reconciliation")
     public Map<String, Object> reconciliation() {
         Map<String, Object> m = new LinkedHashMap<>();
         for (Downstream d : topology.all()) {
             SimulatedDownstreamChannel ch = (SimulatedDownstreamChannel) d.channel();
-            long received = ch.received().size();
+            long admitted = d.buffer().appendedCount();
+            long received = Reconciliation.uniqueReceived(d);
             long buffered = d.buffer().size();
-            long dropped = d.buffer().droppedCount();
-            long appended = received + buffered + dropped;
+            long evicted = d.buffer().droppedCount();
+            long rejectedFull = d.buffer().rejectedCount();
             Map<String, Object> row = new LinkedHashMap<>();
-            row.put("appended", appended);
+            row.put("admitted", admitted);
             row.put("receivedUnique", received);
             row.put("buffered", buffered);
-            row.put("dropped", dropped);
+            row.put("evicted", evicted);
+            row.put("rejectedFull", rejectedFull);
             row.put("duplicateDeliveries", ch.receiver().duplicateCount());
             row.put("lateAccepted", ch.receiver().lateAcceptedCount());
-            row.put("balanced", Reconciliation.balanced(appended, received, buffered, dropped));
+            // 平衡判定使用真实准入计数；分叉时这里会是 false，而不是用反推值永远 true
+            row.put("balanced", Reconciliation.balanced(admitted, received, buffered, evicted));
             m.put(d.name(), row);
         }
-        if (topology.all().size() == 2) {
-            List<TelemetryPoint> cloud = ((SimulatedDownstreamChannel) topology.get("cloud").channel()).received();
-            List<TelemetryPoint> archive = ((SimulatedDownstreamChannel) topology.get("archive").channel()).received();
-            m.put("cloudArchiveDiffs", Reconciliation.diffByPoint(cloud, archive));
+        if (topology.all().size() >= 2) {
+            Downstream reference = topology.all().get(0);
+            List<String> allDiffs = new ArrayList<>();
+            Map<String, List<String>> perPair = new LinkedHashMap<>();
+            for (int i = 1; i < topology.all().size(); i++) {
+                Downstream other = topology.all().get(i);
+                List<String> diffs = Reconciliation.crossDownstreamDiffs(reference, other);
+                perPair.put(reference.name() + "-vs-" + other.name(), diffs);
+                allDiffs.addAll(diffs);
+            }
+            // 逐测点序列（含在途）差异；为空代表两侧对任意测点序号要么都有要么都没有
+            m.put("cloudArchiveDiffs", allDiffs);
+            m.put("pairDiffs", perPair);
+            m.put("crossDownstreamConsistent", allDiffs.isEmpty());
         }
         return m;
     }

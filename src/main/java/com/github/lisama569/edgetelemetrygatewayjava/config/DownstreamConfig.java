@@ -1,6 +1,7 @@
 package com.github.lisama569.edgetelemetrygatewayjava.config;
 
 import com.github.lisama569.edgetelemetrygatewayjava.telemetry.buffer.FileTelemetryBuffer;
+import com.github.lisama569.edgetelemetrygatewayjava.telemetry.buffer.SharedFanOutBuffer;
 import com.github.lisama569.edgetelemetrygatewayjava.telemetry.buffer.TelemetryBuffer;
 import com.github.lisama569.edgetelemetrygatewayjava.telemetry.downstream.ArchiveDownstreamChannel;
 import com.github.lisama569.edgetelemetrygatewayjava.telemetry.downstream.CloudDownstreamChannel;
@@ -9,6 +10,7 @@ import com.github.lisama569.edgetelemetrygatewayjava.telemetry.downstream.Downst
 import com.github.lisama569.edgetelemetrygatewayjava.telemetry.downstream.DownstreamTopology;
 import com.github.lisama569.edgetelemetrygatewayjava.telemetry.downstream.FileIdentityStore;
 import com.github.lisama569.edgetelemetrygatewayjava.telemetry.downstream.IdempotentReceiver;
+import com.github.lisama569.edgetelemetrygatewayjava.telemetry.downstream.SimulatedDownstreamChannel;
 import com.github.lisama569.edgetelemetrygatewayjava.telemetry.forward.Forwarder;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
@@ -21,9 +23,12 @@ import java.util.List;
 /**
  * 下游拓扑装配。
  *
- * - 默认启用归档旁路（telemetry.archive.enabled=true）：cloud + archive 两个独立下游，
- *   各自拥有独立文件缓存（独立进度）、独立幂等身份账本（文件，跨重启保留）、独立转发线程；
- * - 关闭时退化为原单出口（仅 cloud），行为与上一版本兼容。
+ * - 默认启用归档旁路（telemetry.archive.enabled=true）：cloud + archive 共享<strong>一条</strong>
+ *   准入日志（{@link SharedFanOutBuffer}），每个下游只持有独立投递游标、独立幂等身份账本
+ *   （文件，跨重启保留）与独立转发线程：单侧 down/变慢不拖另一侧；共享容量满时整条数据
+ *   被两侧一致拒绝，绝不出现在单侧悄悄淘汰最旧导致的分叉。
+ * - 关闭时退化为原单出口（仅 cloud，独立 {@link FileTelemetryBuffer}，满则淘汰最旧），
+ *   行为与更早版本兼容。
  */
 @Configuration
 public class DownstreamConfig {
@@ -46,20 +51,33 @@ public class DownstreamConfig {
     @Value("${telemetry.archive.enabled:true}")
     private boolean archiveEnabled;
 
-    @Value("${telemetry.archive.buffer.capacity:10000}")
-    private int archiveCapacity;
+    /** 共享准入日志容量；缺省与云端容量一致。 */
+    @Value("${telemetry.fanout.capacity:10000}")
+    private int fanOutCapacity;
+
+    /** 双下游共享准入日志；单出口模式下不创建。 */
+    @Bean
+    public SharedFanOutBuffer sharedFanOutBuffer() {
+        if (!archiveEnabled) {
+            return null;
+        }
+        int sharedCapacity = Math.min(capacity, fanOutCapacity);
+        return SharedFanOutBuffer.create(
+                bufferDir.resolve("fanout"), sharedCapacity, List.of("cloud", "archive"));
+    }
 
     @Bean
-    public DownstreamTopology downstreamTopology() {
-        List<Downstream> list = new ArrayList<>();
-        list.add(buildCloud());
-        if (archiveEnabled) {
-            list.add(buildArchive());
+    public DownstreamTopology downstreamTopology(SharedFanOutBuffer shared) {
+        if (!archiveEnabled || shared == null) {
+            return new DownstreamTopology(List.of(buildSingleCloud()));
         }
+        List<Downstream> list = new ArrayList<>();
+        list.add(buildFromView("cloud", shared.view("cloud"), CloudDownstreamChannel::new));
+        list.add(buildFromView("archive", shared.view("archive"), ArchiveDownstreamChannel::new));
         return new DownstreamTopology(list);
     }
 
-    private Downstream buildCloud() {
+    private Downstream buildSingleCloud() {
         TelemetryBuffer buffer = new FileTelemetryBuffer(bufferDir, capacity);
         IdempotentReceiver receiver = new IdempotentReceiver(
                 new FileIdentityStore(identityDir.resolve("cloud-identities.jsonl")));
@@ -68,17 +86,27 @@ public class DownstreamConfig {
         return new Downstream("cloud", buffer, channel, forwarder);
     }
 
-    private Downstream buildArchive() {
-        TelemetryBuffer buffer = FileTelemetryBuffer.at(bufferDir.resolve("archive-buffer.jsonl"), archiveCapacity);
+    private Downstream buildFromView(String name,
+                                     TelemetryBuffer view,
+                                     ChannelFactory factory) {
         IdempotentReceiver receiver = new IdempotentReceiver(
-                new FileIdentityStore(identityDir.resolve("archive-identities.jsonl")));
-        ArchiveDownstreamChannel channel = new ArchiveDownstreamChannel("archive", receiver);
-        Forwarder forwarder = new Forwarder("archive", buffer, channel, batchSize, intervalMillis);
-        return new Downstream("archive", buffer, channel, forwarder);
+                new FileIdentityStore(identityDir.resolve(name + "-identities.jsonl")));
+        SimulatedDownstreamChannel channel = factory.create(name, receiver);
+        Forwarder forwarder = new Forwarder(name, view, channel, batchSize, intervalMillis);
+        return new Downstream(name, view, channel, forwarder);
+    }
+
+    @FunctionalInterface
+    private interface ChannelFactory {
+        SimulatedDownstreamChannel create(String name, IdempotentReceiver receiver);
     }
 
     @Bean
-    public DownstreamFanOut downstreamFanOut(DownstreamTopology topology) {
-        return new DownstreamFanOut(topology);
+    public DownstreamFanOut downstreamFanOut(DownstreamTopology topology,
+                                             SharedFanOutBuffer shared) {
+        if (!archiveEnabled || shared == null) {
+            return new DownstreamFanOut(topology.get("cloud").buffer());
+        }
+        return new DownstreamFanOut(shared, shared.names());
     }
 }
